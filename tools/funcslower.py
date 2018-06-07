@@ -25,6 +25,7 @@ from __future__ import print_function
 from bcc import BPF
 import argparse
 import ctypes as ct
+import errno
 import time
 
 examples = """examples:
@@ -93,7 +94,7 @@ struct data_t {
     u64 start_ns;
     u64 duration_ns;
     u64 retval;
-    char comm[TASK_COMM_LEN];
+    char name[TASK_COMM_LEN];
 #ifdef USER_STACKS
     int user_stack_id;
 #endif
@@ -110,7 +111,7 @@ BPF_HASH(entryinfo, u64, struct entry_t);
 BPF_PERF_OUTPUT(events);
 
 #if defined(USER_STACKS) || defined(KERNEL_STACKS)
-BPF_STACK_TRACE(stacks, 2048);
+BPF_STACK_TRACE(stack_traces, 2048);
 #endif
 
 static int trace_entry(struct pt_regs *ctx, int id)
@@ -163,11 +164,11 @@ int trace_return(struct pt_regs *ctx)
     data.retval = PT_REGS_RC(ctx);
 
 #ifdef USER_STACKS
-    data.user_stack_id = stacks.get_stackid(ctx, BPF_F_USER_STACK);
+    data.user_stack_id = USER_STACK_GET;
 #endif
 
 #ifdef KERNEL_STACKS
-    data.kernel_stack_id = stacks.get_stackid(ctx, 0);
+    data.kernel_stack_id = KERNEL_STACK_GET;
 
     if (data.kernel_stack_id >= 0) {
         u64 ip = PT_REGS_IP(ctx);
@@ -199,7 +200,7 @@ int trace_return(struct pt_regs *ctx)
 #ifdef GRAB_ARGS
     bpf_probe_read(&data.args[0], sizeof(data.args), entryp->args);
 #endif
-    bpf_get_current_comm(&data.comm, sizeof(data.comm));
+    bpf_get_current_comm(&data.name, sizeof(data.name));
     events.perf_submit(ctx, &data, sizeof(data));
 
     return 0;
@@ -217,6 +218,21 @@ if args.tgid:
     bpf_text = bpf_text.replace('TGID_FILTER', 'tgid != %d' % args.tgid)
 else:
     bpf_text = bpf_text.replace('TGID_FILTER', '0')
+
+# handle stack args
+kernel_stack_get = "stack_traces.get_stackid(ctx, 0)"
+user_stack_get = "stack_traces.get_stackid(ctx, BPF_F_USER_STACK)"
+stack_context = ""
+if args.user_stack:
+    stack_context = "user"
+    kernel_stack_get = "-1"
+elif args.kernel_stack:
+    stack_context = "kernel"
+    user_stack_get = "-1"
+else:
+    stack_context = "user + kernel"
+bpf_text = bpf_text.replace('USER_STACK_GET', user_stack_get)
+bpf_text = bpf_text.replace('KERNEL_STACK_GET', kernel_stack_get)
 
 for i in range(len(args.functions)):
     bpf_text += """
@@ -246,11 +262,11 @@ TASK_COMM_LEN = 16  # linux/sched.h
 class Data(ct.Structure):
     _fields_ = [
         ("id", ct.c_ulonglong),
-        ("tgid_pid", ct.c_ulonglong),
+        ("pid", ct.c_ulonglong),
         ("start_ns", ct.c_ulonglong),
         ("duration_ns", ct.c_ulonglong),
         ("retval", ct.c_ulonglong),
-        ("comm", ct.c_char * TASK_COMM_LEN)
+        ("name", ct.c_char * TASK_COMM_LEN)
     ] + ([("args", ct.c_ulonglong * 6)] if args.arguments else []) + \
             ([("user_stack_id", ct.c_int)] if args.user_stack else []) + \
             ([("kernel_stack_id", ct.c_int),("kernel_ip", ct.c_ulonglong)] if args.kernel_stack else [])
@@ -265,7 +281,7 @@ if not args.folded:
     print("Tracing function calls slower than %g %s... Ctrl+C to quit." %
           (time_value, time_designator))
     print((("%-10s " % "TIME" if time_col else "") + "%-14s %-6s %7s %16s %s") %
-        ("COMM", "PID", "LAT(%s)" % time_designator, "RVAL",
+        ("NAME", "PID", "LAT(%s)" % time_designator, "RVAL",
         "FUNC" + (" ARGS" if args.arguments else "")))
 
 earliest_ts = 0
@@ -285,48 +301,77 @@ def args_str(event):
         return ""
     return str.join(" ", ["0x%x" % arg for arg in event.args[:args.arguments]])
 
+def stack_id_err(stack_id):
+    # -EFAULT in get_stackid normally means the stack-trace is not availible,
+    # Such as getting kernel stack trace in userspace code
+    return (stack_id < 0) and (stack_id != -errno.EFAULT)
+
+def aksym(addr):
+    if args.annotations:
+        return b.ksym(addr) + "_[k]"
+    else:
+        return b.ksym(addr)
+
+need_delimiter = (args.kernel_stack and args.user_stack)
 def print_stack(event):
     user_stack = []
-    stack_traces = b.get_table("stacks")
+    stack_traces = b.get_table("stack_traces")
 
-    if args.user_stack and event.user_stack_id > 0:
-        user_stack = stack_traces.walk(event.user_stack_id)
+    user_stack = [] if not args.user_stack or event.user_stack_id < 0 else \
+        stack_traces.walk(event.user_stack_id)
+    kernel_tmp = [] if not args.kernel_stack or event.kernel_stack_id < 0 else \
+        stack_traces.walk(event.kernel_stack_id)
 
+    # fix kernel stack
     kernel_stack = []
-    if args.kernel_stack and event.kernel_stack_id > 0:
-        kernel_tmp = stack_traces.walk(event.kernel_stack_id)
-
-        # fix kernel stack
+    if args.kernel_stack and event.kernel_stack_id >= 0:
         for addr in kernel_tmp:
             kernel_stack.append(addr)
-        # the later IP checking
-        if event.kernel_ip:
-            kernel_stack.insert(0, event.kernel_ip)
-
-    do_delimiter = user_stack and kernel_stack
 
     if args.folded:
         # print folded stack output
         user_stack = list(user_stack)
         kernel_stack = list(kernel_stack)
-        line = [event.comm.decode()] + \
-            [b.sym(addr, event.tgid_pid) for addr in reversed(user_stack)] + \
-            (do_delimiter and ["-"] or []) + \
-            [b.ksym(addr) for addr in reversed(kernel_stack)]
-        print("%s %d" % (";".join(line), 1))
+        line = [event.name.decode()]
+        # if we failed to get the stack is, such as due to no space (-ENOMEM) or
+        # hash collision (-EEXIST), we still print a placeholder for consistency
+        if args.user_stack:
+            if stack_id_err(event.user_stack_id):
+                line.append("[Missed User Stack]")
+            else:
+                line.extend([str(b.sym(addr, event.pid)) for addr in reversed(user_stack)])
+        if args.kernel_stack:
+            line.extend(["-"] if (need_delimiter and event.kernel_stack_id >= 0 and
+                    event.user_stack_id >= 0) else [])
+            if stack_id_err(event.kernel_stack_id):
+                line.append("[Missed Kernel Stack]")
+            else:
+                line.extend([str(b.ksym(addr)) for addr in reversed(kernel_stack)])
+        print("%s %d" % (str(";".join(line)), 1))
     else:
-        # print default multi-line stack output.
-        for addr in kernel_stack:
-            print("    %s" % b.ksym(addr))
-        for addr in user_stack:
-            print("    %s" % b.sym(addr, event.tgid_pid))
+        # print default multi-line stack output
+        if not args.user_stack:
+            if stack_id_err(event.kernel_stack_id):
+                print("    [Missed Kernel Stack]")
+            else:
+                for addr in kernel_stack:
+                    print("    %s" % aksym(addr))
+        if not args.kernel_stack:
+            if need_delimiter and event.user_stack_id >= 0 and event.kernel_stack_id >= 0:
+                print("    --")
+            if stack_id_err(event.user_stack_id):
+                print("    [Missed User Stack]")
+            else:
+                for addr in user_stack:
+                    print("    %s" % b.sym(addr, event.pid))
+        print("    %-16s %s (%d)" % ("-", event.name.decode(), event.pid))
 
 def print_event(cpu, data, size):
     event = ct.cast(data, ct.POINTER(Data)).contents
     ts = float(event.duration_ns) / time_multiplier
     if not args.folded:
         print((time_str(event) + "%-14.14s %-6s %7.2f %16x %s %s") %
-            (event.comm.decode(), event.tgid_pid >> 32,
+            (event.name.decode(), event.pid >> 32,
              ts, event.retval, args.functions[event.id], args_str(event)))
     if args.user_stack or args.kernel_stack:
         print_stack(event)
